@@ -3,16 +3,15 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aclient"
+name = "llmrunner"
 version = "0.1.0"
-description = "Async LLM client with concurrency control, retries, and recoverable batch state"
+description = "Async LLM runner with concurrency control, retries, and recoverable batch state"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["tqdm>=4.66.0"]
+dependencies = ["openai>=1.30.0", "tqdm>=4.66.0"]
 
 [project.optional-dependencies]
-openai = ["openai>=1.30.0"]
 test = ["pytest>=8.0.0"]
 
 [tool.setuptools.packages.find]
-include = ["aclient*"]
+include = ["llmrunner*"]

@@ -41,9 +41,46 @@ class AsyncCreate:
         index = messages[0]["index"]
         count = self.counts.get(index, 0)
         self.counts[index] = count + 1
-        self.calls.append((index, count, kwargs["model"]))
+        self.calls.append({"index": index, "count": count, "kwargs": dict(kwargs)})
         if index in self.delays:
             await asyncio.sleep(self.delays[index])
+
+        response = self.responses[index]
+        if self._is_response_sequence(response):
+            response = response[count]
+        if isinstance(response, Exception):
+            raise response
+        return _Response(response)
+
+    def _is_response_sequence(self, response):
+        if not isinstance(response, list):
+            return False
+
+        for item in response:
+            if isinstance(item, Exception):
+                return True
+            if isinstance(item, str):
+                continue
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                return False
+            if getattr(item, "type", None) == "text" and isinstance(getattr(item, "text", None), str):
+                return False
+            return True
+
+        return True
+
+
+class AsyncMethodCreate:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+        self.counts = {}
+
+    async def create(self, *, messages, **kwargs):
+        index = messages[0]["index"]
+        count = self.counts.get(index, 0)
+        self.counts[index] = count + 1
+        self.calls.append({"index": index, "count": count, "kwargs": dict(kwargs)})
 
         response = self.responses[index]
         if isinstance(response, list):
@@ -63,7 +100,7 @@ class SyncCreate:
         index = messages[0]["index"]
         count = self.counts.get(index, 0)
         self.counts[index] = count + 1
-        self.calls.append((index, count, kwargs["model"]))
+        self.calls.append({"index": index, "count": count, "kwargs": dict(kwargs)})
 
         response = self.responses[index]
         if isinstance(response, list):
@@ -115,6 +152,10 @@ def make_openai_client(create):
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
 
+def make_openai_client_from_methods(completions):
+    return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+
 def make_histories(count):
     return [[{"role": "user", "content": f"message-{index}", "index": index}] for index in range(count)]
 
@@ -127,10 +168,9 @@ def repair_json(task: Task):
     try:
         return json.loads(task.output)
     except json.JSONDecodeError as exc:
-        task.history += [
-            {"role": "assistant", "content": task.output, "index": task.index},
-            {"role": "user", "content": f"Output is not valid JSON: {exc}", "index": task.index},
-        ]
+        task.messages.append(
+            {"role": "user", "content": f"Output is not valid JSON: {exc}", "index": task.index}
+        )
         return task
 
 
@@ -140,9 +180,8 @@ def replace_task_instance(task: Task):
     except json.JSONDecodeError as exc:
         return Task(
             index=task.index,
-            history=task.history
+            messages=task.messages
             + [
-                {"role": "assistant", "content": task.output, "index": task.index},
                 {"role": "user", "content": f"Fix JSON: {exc}", "index": task.index},
             ],
             output=task.output,
@@ -165,7 +204,7 @@ def test_successful_batch_returns_ordered_results_for_async_client():
     )
     runner = Runner(client=client, max_concurrency=3, show_progress=False)
 
-    results = runner.run(make_histories(3), model="gpt-4o-mini")
+    results = runner.run(make_histories(3), model="gpt-4o-mini", temperature=0.2)
 
     assert [result.index for result in results] == [0, 1, 2]
     assert [result.output for result in results] == ["zero", "one", "two"]
@@ -173,14 +212,45 @@ def test_successful_batch_returns_ordered_results_for_async_client():
     assert runner.last_results is results
 
 
+def test_successful_batch_returns_ordered_results_for_async_bound_method_client():
+    completions = AsyncMethodCreate(responses={0: "zero", 1: "one"})
+    runner = Runner(client=make_openai_client_from_methods(completions), max_concurrency=2, show_progress=False)
+
+    results = runner.run(make_histories(2), model="gpt-4o-mini", temperature=0.2)
+
+    assert [result.output for result in results] == ["zero", "one"]
+    assert all(result.status == "success" for result in results)
+
+
 def test_successful_batch_returns_ordered_results_for_sync_client():
     client = make_openai_client(SyncCreate(responses={0: "zero", 1: "one"}))
     runner = Runner(client=client, max_concurrency=2, show_progress=False)
 
-    results = runner.run(make_histories(2), model="gpt-4o-mini")
+    results = runner.run(make_histories(2), model="gpt-4o-mini", temperature=0.2)
 
     assert [result.output for result in results] == ["zero", "one"]
     assert all(result.status == "success" for result in results)
+
+
+def test_runner_accepts_prebuilt_tasks_and_keeps_arbitrary_fields():
+    client = make_openai_client(AsyncCreate(responses={0: "zero", 1: "one"}))
+    runner = Runner(client=client, max_concurrency=2, show_progress=False)
+    tasks = [
+        Task(messages=make_histories(1)[0], request_id="req-0", payload={"topic": "ada"}),
+        Task(messages=make_histories(2)[1], custom_note=["keep", "me"], metadata={"source": "user"}),
+    ]
+
+    results = runner.run(tasks, model="gpt-4o-mini", temperature=0.2)
+
+    assert results[0] is tasks[0]
+    assert results[1] is tasks[1]
+    assert results[0].index == 0
+    assert results[1].index == 1
+    assert results[0].request_id == "req-0"
+    assert results[0].payload == {"topic": "ada"}
+    assert results[1].custom_note == ["keep", "me"]
+    assert results[1].metadata == {"source": "user", "last_text": "one", "retry_count": 0, "total_backend_calls": 1}
+    assert results[0].messages[-1] == {"role": "assistant", "content": "zero"}
 
 
 def test_pipeline_stage_returns_parsed_output():
@@ -194,6 +264,33 @@ def test_pipeline_stage_returns_parsed_output():
     assert results[0].metadata["last_text"] == json.dumps({"name": "Ada"})
 
 
+def test_common_request_settings_are_forwarded():
+    create = AsyncCreate(responses={0: "ok"})
+    runner = Runner(client=make_openai_client(create), show_progress=False)
+
+    runner.run(
+        make_histories(1),
+        model="gpt-4o-mini",
+        temperature=0.2,
+        max_tokens=64,
+        top_p=0.9,
+        stop=["END"],
+        presence_penalty=0.1,
+        frequency_penalty=0.2,
+        timeout=30.0,
+    )
+
+    forwarded = create.calls[0]["kwargs"]
+    assert forwarded["model"] == "gpt-4o-mini"
+    assert forwarded["temperature"] == 0.2
+    assert forwarded["max_tokens"] == 64
+    assert forwarded["top_p"] == 0.9
+    assert forwarded["stop"] == ["END"]
+    assert forwarded["presence_penalty"] == 0.1
+    assert forwarded["frequency_penalty"] == 0.2
+    assert forwarded["timeout"] == 30.0
+
+
 def test_pipeline_stage_can_requeue_with_updated_history():
     client = make_openai_client(AsyncCreate(responses={0: ["not-json", json.dumps({"name": "Ada"})]}))
     runner = Runner(client=client, show_progress=False)
@@ -203,7 +300,8 @@ def test_pipeline_stage_can_requeue_with_updated_history():
     assert results[0].status == "success"
     assert results[0].output == {"name": "Ada"}
     assert results[0].metadata["total_backend_calls"] == 2
-    assert results[0].history[-1]["content"].startswith("Output is not valid JSON")
+    assert results[0].messages[-2]["content"].startswith("Output is not valid JSON")
+    assert results[0].messages[-1] == {"role": "assistant", "content": json.dumps({"name": "Ada"})}
 
 
 def test_pipeline_can_replace_task_instance():
@@ -217,16 +315,23 @@ def test_pipeline_can_replace_task_instance():
     assert results[0].metadata["total_backend_calls"] == 2
 
 
+def test_latest_assistant_message_is_preserved_on_success():
+    client = make_openai_client(AsyncCreate(responses={0: "final-answer"}))
+    runner = Runner(client=client, show_progress=False)
+
+    results = runner.run(make_histories(1), model="gpt-4o-mini")
+
+    assert results[0].status == "success"
+    assert results[0].messages[-1] == {"role": "assistant", "content": "final-answer"}
+
+
 def test_retry_is_applied_per_requeued_turn():
     runner = Runner(client=make_openai_client(RetryAsyncCreate()), max_retries=1, show_progress=False)
 
     def retrying_pipeline(task: Task):
         parsed = json.loads(task.output)
-        if len(task.history) == 1:
-            task.history += [
-                {"role": "assistant", "content": task.output, "index": task.index},
-                {"role": "user", "content": "Try again", "index": task.index},
-            ]
+        if len(task.messages) == 2:
+            task.messages.append({"role": "user", "content": "Try again", "index": task.index})
             return task
         return parsed
 

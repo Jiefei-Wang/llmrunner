@@ -7,3 +7,5 @@ __pycache__/
 venv/
 dist/
 build/
+.codex
+design.md

@@ -23,10 +23,7 @@ def parse_json(task: Task):
     try:
         return json.loads(output)
     except json.JSONDecodeError as exc:
-        task.history += [
-            {"role": "assistant", "content": output},
-            {"role": "user", "content": f"Output is not valid JSON: {exc}"},
-        ]
+        task.messages.append({"role": "user", "content": f"Output is not valid JSON: {exc}"})
         return task
 
 
@@ -39,21 +36,35 @@ runner = Runner(
     retry_delay=1.0,
 )
 
-histories = [
+messages_list = [
     [{"role": "user", "content": "Return JSON: {\"name\": \"Ada\"}"}],
     [{"role": "user", "content": "Return JSON: {\"name\": \"Grace\"}"}],
 ]
 
-results = runner.run(histories, pipeline=[parse_json], model="gpt-4o-mini")
+# create tasks with any extra attributes you want to use in the pipeline or final results
+# here we attach a `customer` dict as the extra attribute
+tasks = [
+    Task(messages=messages_list[0], customer={"name": "Ada"}),
+    Task(messages=messages_list[1], customer={"name": "Grace"}),
+]
+
+results = runner.run(
+    tasks,
+    pipeline=[parse_json],
+    model="gpt-4o-mini",
+    temperature=0.2,
+)
 
 for result in results:
-    print(result.index, result.status, result.output, result.error, result.history)
+    print(result.index, result.status, result.output, result.error, result.messages, result.customer)
 ```
 
 Each result is a `Task` with:
 
 - `index`: input position
-- `history`: current message history, reused for follow-up turns
+- `messages`: current message list, reused for follow-up turns
+  and including the latest assistant reply from the backend
+- any extra attributes you attached when creating the task, such as `customer`
 - `status`: `success`, `error`, or `cancelled`
 - `output`: latest model text, or the final transformed value returned by the pipeline
 - `error`: request or parse error string
@@ -62,7 +73,7 @@ Each result is a `Task` with:
 
 Pipeline stages accept a `Task` and may return:
 
-- a `Task` to enqueue another backend request with the updated `task.history`
+- a `Task` to enqueue another backend request with the updated `task.messages`
 - any non-`Task` value to finish that slot successfully
 
 After every new backend response, the pipeline restarts from the first stage.
@@ -73,10 +84,14 @@ After every new backend response, the pipeline restarts from the first stage.
 
 ```python
 try:
-    results = runner.run(histories, pipeline=[parse_json], model="gpt-4o-mini")
+    results = runner.run(tasks, pipeline=[parse_json], model="gpt-4o-mini", temperature=0.2)
 except KeyboardInterrupt:
     results = runner.last_results
 ```
+
+Common request settings such as `model`, `temperature`, `max_tokens`, `top_p`, `stop`,
+`presence_penalty`, `frequency_penalty`, and `timeout` are exposed directly on `run()` and `arun()`.
+Less common OpenAI request options can still be passed through as extra keyword arguments.
 
 ## Client Support
 

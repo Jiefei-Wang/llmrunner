@@ -48,23 +48,66 @@ class Runner:
 
     def run(
         self,
-        histories: Sequence[list[dict[str, Any]]],
+        inputs: Sequence[Task | list[dict[str, Any]]],
         pipeline: Sequence[PipelineStage] | None = None,
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        stop: str | Sequence[str] | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        timeout: float | None = None,
         **request_kwargs: Any,
     ) -> list[Task]:
-        return asyncio.run(self.arun(histories, pipeline=pipeline, **request_kwargs))
+        return asyncio.run(
+            self.arun(
+                inputs,
+                pipeline=pipeline,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stop=stop,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                timeout=timeout,
+                **request_kwargs,
+            )
+        )
 
     async def arun(
         self,
-        histories: Sequence[list[dict[str, Any]]],
+        inputs: Sequence[Task | list[dict[str, Any]]],
         pipeline: Sequence[PipelineStage] | None = None,
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        stop: str | Sequence[str] | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        timeout: float | None = None,
         **request_kwargs: Any,
     ) -> list[Task]:
+        request_kwargs = self._build_request_kwargs(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            timeout=timeout,
+            extra_kwargs=request_kwargs,
+        )
         self._validate_request_kwargs(request_kwargs)
         self._interrupted = False
-        self._init_results(histories)
+        self._init_results(inputs)
         semaphore = asyncio.Semaphore(self.max_concurrency)
-        progress = self._make_progress(total=len(histories))
+        progress = self._make_progress(total=len(inputs))
         active_pipeline = list(pipeline or [])
         self._current_tasks = [
             asyncio.create_task(
@@ -75,7 +118,7 @@ class Runner:
                     request_kwargs=request_kwargs,
                 )
             )
-            for index in range(len(histories))
+            for index in range(len(inputs))
         ]
 
         try:
@@ -107,12 +150,16 @@ class Runner:
     def get_failures(self) -> list[Task]:
         return [result for result in self.last_results if result.status in {"error", "cancelled"}]
 
-    def _init_results(self, histories: Sequence[list[dict[str, Any]]]) -> None:
-        self.last_results = [
-            Task(index=index, history=list(messages))
-            for index, messages in enumerate(histories)
-        ]
-        self._states = {index: "pending" for index in range(len(histories))}
+    def _init_results(self, inputs: Sequence[Task | list[dict[str, Any]]]) -> None:
+        self.last_results = [self._normalize_task_input(index, item) for index, item in enumerate(inputs)]
+        self._states = {index: "pending" for index in range(len(inputs))}
+
+    def _normalize_task_input(self, index: int, item: Task | list[dict[str, Any]]) -> Task:
+        if isinstance(item, Task):
+            item.index = index
+            return item
+
+        return Task(index=index, messages=list(item))
 
     async def _run_one(
         self,
@@ -129,6 +176,7 @@ class Runner:
 
             task.output = text
             task.metadata["last_text"] = text
+            task.messages.append({"role": "assistant", "content": text})
 
             if not pipeline:
                 task.status = "success"
@@ -168,7 +216,7 @@ class Runner:
             try:
                 async with semaphore:
                     task.metadata["total_backend_calls"] = task.metadata.get("total_backend_calls", 0) + 1
-                    response = await self._create(messages=task.history, **request_kwargs)
+                    response = await self._create(messages=task.messages, **request_kwargs)
                     text = self._extract_text(response)
             except asyncio.CancelledError:
                 task.status = "cancelled"
@@ -249,20 +297,48 @@ class Runner:
         )
 
     def _wrap_create(self, create: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
-        if self._is_async_callable(create):
-            return create
+        async def call(**kwargs: Any) -> Any:
+            result = create(**kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
 
-        async def call_sync(**kwargs: Any) -> Any:
-            return create(**kwargs)
-
-        return call_sync
-
-    def _is_async_callable(self, value: Callable[..., Any]) -> bool:
-        return inspect.iscoroutinefunction(value) or inspect.iscoroutinefunction(getattr(value, "__call__", None))
+        return call
 
     def _validate_request_kwargs(self, request_kwargs: dict[str, Any]) -> None:
         if not request_kwargs.get("model"):
             raise ValueError("Runner requires `model` to be passed to `run()` or `arun()`.")
+
+    def _build_request_kwargs(
+        self,
+        *,
+        model: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        top_p: float | None,
+        stop: str | Sequence[str] | None,
+        presence_penalty: float | None,
+        frequency_penalty: float | None,
+        timeout: float | None,
+        extra_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        request_kwargs: dict[str, Any] = {"model": model}
+        if temperature is not None:
+            request_kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            request_kwargs["max_tokens"] = max_tokens
+        if top_p is not None:
+            request_kwargs["top_p"] = top_p
+        if stop is not None:
+            request_kwargs["stop"] = stop
+        if presence_penalty is not None:
+            request_kwargs["presence_penalty"] = presence_penalty
+        if frequency_penalty is not None:
+            request_kwargs["frequency_penalty"] = frequency_penalty
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        request_kwargs.update(extra_kwargs)
+        return request_kwargs
 
     def _extract_text(self, response: Any) -> str:
         choices = getattr(response, "choices", None)

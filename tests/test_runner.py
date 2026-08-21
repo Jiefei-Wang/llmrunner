@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from llmrunner import Runner, Task
+from llmrunner.dashboard import DashboardModel, JupyterDisplay, NullDisplay
 
 
 class _TextPart:
@@ -28,6 +29,76 @@ class _Choice:
 class _Response:
     def __init__(self, content):
         self.choices = [_Choice(content)]
+
+
+def make_chunk(content):
+    return {"choices": [{"delta": {"content": content}}]}
+
+
+class AsyncStream:
+    def __init__(self, chunks, fail_after=None):
+        self.chunks = list(chunks)
+        self.fail_after = fail_after
+        self.position = 0
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.sleep(0)
+        if self.fail_after is not None and self.position >= self.fail_after:
+            raise RuntimeError("stream interrupted")
+        if self.position >= len(self.chunks):
+            raise StopAsyncIteration
+        chunk = self.chunks[self.position]
+        self.position += 1
+        return chunk
+
+    async def close(self):
+        self.closed = True
+
+
+class SyncStream:
+    def __init__(self, chunks):
+        self.chunks = iter(chunks)
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.chunks)
+
+    def close(self):
+        self.closed = True
+
+
+class AsyncStreamingCreate:
+    def __init__(self, streams):
+        self.streams = list(streams)
+        self.calls = []
+
+    async def __call__(self, *, messages, **kwargs):
+        self.calls.append(dict(kwargs))
+        if kwargs["stream"]:
+            return self.streams.pop(0)
+        return _Response("non-stream")
+
+
+class SyncStreamingCreate:
+    def __init__(self, stream):
+        self.stream = stream
+        self.calls = []
+
+    def __call__(self, *, messages, **kwargs):
+        self.calls.append(dict(kwargs))
+        return self.stream
+
+
+class CaptureDisplay(NullDisplay):
+    def __init__(self, model):
+        self.model = model
 
 
 class AsyncCreate:
@@ -423,3 +494,151 @@ def test_content_normalization_handles_text_parts():
     results = runner.run(make_histories(1), model="gpt-4o-mini")
 
     assert results[0].output == "Ada Lovelace"
+
+
+def test_async_stream_is_aggregated_and_forwarded():
+    stream = AsyncStream(
+        [
+            make_chunk("hello"),
+            make_chunk(None),
+            {"choices": []},
+            make_chunk([{"type": "text", "text": "\nworld"}]),
+        ]
+    )
+    create = AsyncStreamingCreate([stream])
+    runner = Runner(client=make_openai_client(create), show_progress=False)
+
+    results = runner.run(make_histories(1), model="gpt-4o-mini", interactive=False)
+
+    assert results[0].output == "hello\nworld"
+    assert results[0].messages[-1] == {"role": "assistant", "content": "hello\nworld"}
+    assert create.calls[0]["stream"] is True
+    assert stream.closed is True
+
+
+def test_sync_stream_is_consumed_without_changing_result_contract():
+    stream = SyncStream([make_chunk("sync"), make_chunk(" stream")])
+    create = SyncStreamingCreate(stream)
+    runner = Runner(client=make_openai_client(create), show_progress=False)
+
+    results = runner.run(make_histories(1), model="gpt-4o-mini", interactive=False)
+
+    assert results[0].output == "sync stream"
+    assert stream.closed is True
+    assert create.calls[0]["stream"] is True
+
+
+def test_stream_false_uses_full_response_and_forwards_flag():
+    create = AsyncStreamingCreate([])
+    runner = Runner(client=make_openai_client(create), show_progress=False)
+
+    results = runner.run(
+        make_histories(1),
+        model="gpt-4o-mini",
+        stream=False,
+        interactive=False,
+    )
+
+    assert results[0].output == "non-stream"
+    assert create.calls[0]["stream"] is False
+
+
+def test_partial_stream_is_discarded_before_retry(monkeypatch):
+    first = AsyncStream([make_chunk("discard-me")], fail_after=1)
+    second = AsyncStream([make_chunk("kept")])
+    create = AsyncStreamingCreate([first, second])
+    captured = {}
+
+    def make_capture(model, **kwargs):
+        captured["display"] = CaptureDisplay(model)
+        return captured["display"]
+
+    monkeypatch.setattr("llmrunner.runner.make_display", make_capture)
+    runner = Runner(client=make_openai_client(create), max_retries=1, show_progress=False)
+
+    results = runner.run(make_histories(1), model="gpt-4o-mini")
+
+    assert results[0].output == "kept"
+    assert results[0].messages[-1]["content"] == "kept"
+    assert results[0].metadata["retry_count"] == 1
+    assert captured["display"].model.snapshot(0).generated_chars == len("kept")
+
+
+def test_dashboard_model_sorts_unfinished_first_and_formats_full_detail():
+    tasks = [
+        Task(index=0, messages=[{"role": "user", "content": "first\nline"}], status="success"),
+        Task(index=1, messages=[{"role": "user", "content": "<unsafe>"}]),
+    ]
+    model = DashboardModel(tasks)
+    model.mark_terminal(tasks[0])
+    model.begin_attempt(1)
+    model.append_delta(1, "draft")
+
+    rows = model.sorted_snapshots("default", False)
+
+    assert [row.index for row in rows] == [1, 0]
+    assert rows[0].generated_chars == 5
+    assert "<unsafe>" in rows[0].detail
+    assert '"streaming": true' in rows[0].detail
+
+
+def test_jupyter_dashboard_paginates_and_escapes_expanded_content():
+    tasks = [Task(index=index, messages=[{"role": "user", "content": f"<{index}>\nnext"}]) for index in range(12)]
+    model = DashboardModel(tasks)
+    display = JupyterDisplay(model, show_progress=True)
+    display._display = lambda _: None
+
+    async def exercise():
+        await display.start()
+        assert len(display._table.children) == 11
+        assert "1/2" in display._page_label.value
+        button_ids = [id(row.expand) for row in display._rows]
+        display._rows[0].expand.click()
+        expanded = display._rows[0].detail
+        assert "&lt;0&gt;" in expanded.value
+        assert "max-height:320px" in expanded.value
+        model.append_delta(0, "new text")
+        display._refresh()
+        assert [id(row.expand) for row in display._rows] == button_ids
+        display._change_page(1)
+        assert display._visible_indices[:2] == [10, 11]
+        assert all(row.container.layout.display == "none" for row in display._rows[2:])
+        await display.close()
+
+    asyncio.run(exercise())
+
+
+def test_terminal_dashboard_supports_paging_and_expansion():
+    pytest.importorskip("textual")
+    from textual.widgets import DataTable, Static
+
+    from llmrunner.terminal_dashboard import TerminalDashboard
+
+    tasks = [Task(index=index, messages=[{"role": "user", "content": f"message-{index}"}]) for index in range(12)]
+    model = DashboardModel(tasks)
+    app = TerminalDashboard(model, show_progress=True)
+
+    async def exercise():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#tasks", DataTable).row_count == 10
+            await pilot.press("right")
+            await pilot.pause()
+            assert app.page == 1
+            assert app.query_one("#tasks", DataTable).row_count == 2
+            await pilot.press("enter")
+            await pilot.pause()
+            detail = app.query_one("#detail", Static).render()
+            assert "message-10" in detail.plain
+
+    asyncio.run(exercise())
+
+
+def test_run_rejects_an_active_event_loop():
+    runner = Runner(client=make_openai_client(AsyncCreate(responses={0: "ok"})), show_progress=False)
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="await runner.arun"):
+            runner.run(make_histories(1), model="gpt-4o-mini", interactive=False)
+
+    asyncio.run(exercise())

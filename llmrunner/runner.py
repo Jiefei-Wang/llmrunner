@@ -2,20 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
+from .dashboard import DashboardModel, make_display
 from .types import Task
 
 PipelineStage = Callable[[Task], Task | Any] | Callable[[Task], Awaitable[Task | Any]]
-
-
-class _NullProgress:
-    def update(self, _: int = 1) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
 
 
 class Runner:
@@ -51,6 +45,8 @@ class Runner:
         inputs: Sequence[Task | list[dict[str, Any]]],
         pipeline: Sequence[PipelineStage] | None = None,
         *,
+        stream: bool = True,
+        interactive: bool = True,
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -61,10 +57,22 @@ class Runner:
         timeout: float | None = None,
         **request_kwargs: Any,
     ) -> list[Task]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "Runner.run() cannot be used while an event loop is running; "
+                "use `await runner.arun(...)` instead (including in Jupyter notebooks)."
+            )
+
         return asyncio.run(
             self.arun(
                 inputs,
                 pipeline=pipeline,
+                stream=stream,
+                interactive=interactive,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -82,6 +90,8 @@ class Runner:
         inputs: Sequence[Task | list[dict[str, Any]]],
         pipeline: Sequence[PipelineStage] | None = None,
         *,
+        stream: bool = True,
+        interactive: bool = True,
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -106,8 +116,28 @@ class Runner:
         self._validate_request_kwargs(request_kwargs)
         self._interrupted = False
         self._init_results(inputs)
+        dashboard = DashboardModel(self.last_results)
+        display = make_display(
+            dashboard,
+            interactive=interactive,
+            show_progress=self.show_progress,
+        )
+        try:
+            await display.start()
+        except Exception as exc:
+            warnings.warn(f"Interactive dashboard failed to start: {exc}", RuntimeWarning)
+            try:
+                await display.close()
+            except Exception:
+                pass
+            display = make_display(
+                dashboard,
+                interactive=False,
+                show_progress=self.show_progress,
+            )
+            await display.start()
+
         semaphore = asyncio.Semaphore(self.max_concurrency)
-        progress = self._make_progress(total=len(inputs))
         active_pipeline = list(pipeline or [])
         self._current_tasks = [
             asyncio.create_task(
@@ -116,6 +146,8 @@ class Runner:
                     pipeline=active_pipeline,
                     semaphore=semaphore,
                     request_kwargs=request_kwargs,
+                    stream=stream,
+                    dashboard=dashboard,
                 )
             )
             for index in range(len(inputs))
@@ -126,14 +158,20 @@ class Runner:
                 try:
                     await current
                 finally:
-                    progress.update(1)
+                    try:
+                        display.task_completed()
+                    except Exception as exc:
+                        warnings.warn(f"Progress display update failed: {exc}", RuntimeWarning)
         except (asyncio.CancelledError, KeyboardInterrupt):
             self._interrupted = True
             await self._cancel_unfinished_tasks()
-            self._finalize_cancelled_slots()
+            self._finalize_cancelled_slots(dashboard)
             raise
         finally:
-            progress.close()
+            try:
+                await display.close()
+            except Exception as exc:
+                warnings.warn(f"Progress display cleanup failed: {exc}", RuntimeWarning)
             self._current_tasks = []
             self._states = {}
 
@@ -167,11 +205,21 @@ class Runner:
         pipeline: Sequence[PipelineStage],
         semaphore: asyncio.Semaphore,
         request_kwargs: dict[str, Any],
+        stream: bool,
+        dashboard: DashboardModel,
     ) -> None:
         while True:
             self._states[task.index] = "running"
-            text = await self._generate_with_retries(task, semaphore, request_kwargs)
+            dashboard.set_state(task.index, "running")
+            text = await self._generate_with_retries(
+                task,
+                semaphore,
+                request_kwargs,
+                stream,
+                dashboard,
+            )
             if task.status in {"error", "cancelled"}:
+                dashboard.mark_terminal(task)
                 return
 
             task.output = text
@@ -181,6 +229,7 @@ class Runner:
             if not pipeline:
                 task.status = "success"
                 self._states[task.index] = "success"
+                dashboard.mark_terminal(task)
                 return
 
             try:
@@ -190,15 +239,17 @@ class Runner:
                 task.error = str(exc)
                 task.metadata["error_type"] = type(exc).__name__
                 self._states[task.index] = "error"
+                dashboard.mark_terminal(task)
                 return
 
             if isinstance(final_output, Task):
-                task = self._replace_task(task, final_output)
+                task = self._replace_task(task, final_output, dashboard)
                 continue
 
             task.output = final_output
             task.status = "success"
             self._states[task.index] = "success"
+            dashboard.mark_terminal(task)
             return
 
     async def _generate_with_retries(
@@ -206,24 +257,35 @@ class Runner:
         task: Task,
         semaphore: asyncio.Semaphore,
         request_kwargs: dict[str, Any],
+        stream: bool,
+        dashboard: DashboardModel,
     ) -> str | None:
         max_attempts = self.max_retries + 1
 
         for attempt in range(1, max_attempts + 1):
             task.attempts = attempt
             task.error = None
+            dashboard.begin_attempt(task.index)
 
             try:
                 async with semaphore:
                     task.metadata["total_backend_calls"] = task.metadata.get("total_backend_calls", 0) + 1
-                    response = await self._create(messages=task.messages, **request_kwargs)
-                    text = self._extract_text(response)
+                    response = await self._create(messages=task.messages, stream=stream, **request_kwargs)
+                    if stream:
+                        text = await self._consume_stream(
+                            response,
+                            lambda delta: dashboard.append_delta(task.index, delta),
+                        )
+                    else:
+                        text = self._extract_text(response)
             except asyncio.CancelledError:
+                dashboard.discard_attempt(task.index)
                 task.status = "cancelled"
                 task.error = "Request cancelled"
                 self._states[task.index] = "cancelled"
                 raise
             except Exception as exc:
+                dashboard.discard_attempt(task.index)
                 if attempt < max_attempts:
                     task.metadata["last_error"] = str(exc)
                     task.metadata["retry_count"] = attempt
@@ -239,6 +301,7 @@ class Runner:
                 return None
 
             task.metadata["retry_count"] = attempt - 1
+            dashboard.commit_response(task.index, text)
             return text
 
         return None
@@ -256,9 +319,10 @@ class Runner:
 
         return current
 
-    def _replace_task(self, current: Task, replacement: Task) -> Task:
+    def _replace_task(self, current: Task, replacement: Task, dashboard: DashboardModel) -> Task:
         replacement.index = current.index
         self.last_results[current.index] = replacement
+        dashboard.replace_task(current.index, replacement)
         return replacement
 
     async def _cancel_unfinished_tasks(self) -> None:
@@ -269,23 +333,13 @@ class Runner:
         if unfinished:
             await asyncio.gather(*unfinished, return_exceptions=True)
 
-    def _finalize_cancelled_slots(self) -> None:
+    def _finalize_cancelled_slots(self, dashboard: DashboardModel) -> None:
         for task in self.last_results:
             if task.status is None:
                 task.status = "cancelled"
                 if task.error is None:
                     task.error = "Batch interrupted"
-
-    def _make_progress(self, total: int) -> Any:
-        if not self.show_progress or total == 0:
-            return _NullProgress()
-
-        try:
-            from tqdm.auto import tqdm
-        except ImportError:
-            return _NullProgress()
-
-        return tqdm(total=total, desc="LLM requests", unit="req")
+            dashboard.mark_terminal(task)
 
     def _resolve_openai_create(self, client: Any) -> Callable[..., Any]:
         create = getattr(getattr(getattr(client, "chat", None), "completions", None), "create", None)
@@ -297,8 +351,15 @@ class Runner:
         )
 
     def _wrap_create(self, create: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
+        is_async = inspect.iscoroutinefunction(create) or inspect.iscoroutinefunction(
+            getattr(create, "__call__", None)
+        )
+
         async def call(**kwargs: Any) -> Any:
-            result = create(**kwargs)
+            if is_async:
+                result = create(**kwargs)
+            else:
+                result = await asyncio.to_thread(create, **kwargs)
             if inspect.isawaitable(result):
                 return await result
             return result
@@ -358,6 +419,97 @@ class Runner:
         if content is None and isinstance(message, dict):
             content = message.get("content")
         return self._normalize_content(content)
+
+    async def _consume_stream(self, response: Any, on_delta: Callable[[str], None]) -> str:
+        if hasattr(response, "__aiter__"):
+            parts: list[str] = []
+            try:
+                async for chunk in response:
+                    delta = self._extract_delta_text(chunk)
+                    if delta:
+                        parts.append(delta)
+                        on_delta(delta)
+            finally:
+                await self._close_stream(response)
+            return "".join(parts)
+
+        if hasattr(response, "__iter__") and not isinstance(response, (dict, str, bytes)):
+            parts = []
+            iterator = iter(response)
+            sentinel = object()
+            try:
+                while True:
+                    chunk = await asyncio.to_thread(self._next_or_sentinel, iterator, sentinel)
+                    if chunk is sentinel:
+                        break
+                    delta = self._extract_delta_text(chunk)
+                    if delta:
+                        parts.append(delta)
+                        on_delta(delta)
+            finally:
+                await self._close_stream(response)
+            return "".join(parts)
+
+        text = self._extract_text(response)
+        if text:
+            on_delta(text)
+        return text
+
+    @staticmethod
+    def _next_or_sentinel(iterator: Any, sentinel: object) -> Any:
+        try:
+            return next(iterator)
+        except StopIteration:
+            return sentinel
+
+    async def _close_stream(self, stream: Any) -> None:
+        close = getattr(stream, "close", None)
+        if close is None:
+            close = getattr(stream, "aclose", None)
+        if not callable(close):
+            return
+
+        if inspect.iscoroutinefunction(close):
+            await close()
+            return
+        result = await asyncio.to_thread(close)
+        if inspect.isawaitable(result):
+            await result
+
+    def _extract_delta_text(self, chunk: Any) -> str:
+        choices = getattr(chunk, "choices", None)
+        if choices is None and isinstance(chunk, dict):
+            choices = chunk.get("choices")
+        if not choices:
+            return ""
+
+        first_choice = choices[0]
+        delta = getattr(first_choice, "delta", None)
+        if delta is None and isinstance(first_choice, dict):
+            delta = first_choice.get("delta")
+        if delta is None:
+            return ""
+
+        content = getattr(delta, "content", None)
+        if content is None and isinstance(delta, dict):
+            content = delta.get("content")
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                text = getattr(item, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "".join(parts)
+        return ""
 
     def _normalize_content(self, content: Any) -> str:
         if isinstance(content, str):

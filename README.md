@@ -53,6 +53,8 @@ results = runner.run(
     pipeline=[parse_json],
     model="gpt-4o-mini",
     temperature=0.2,
+    stream=True,
+    interactive=True,
 )
 
 for result in results:
@@ -92,6 +94,50 @@ except KeyboardInterrupt:
 Common request settings such as `model`, `temperature`, `max_tokens`, `top_p`, `stop`,
 `presence_penalty`, `frequency_penalty`, and `timeout` are exposed directly on `run()` and `arun()`.
 Less common OpenAI request options can still be passed through as extra keyword arguments.
+
+## Streaming and interactive dashboards
+
+`run()` and `arun()` stream Chat Completions and show an interactive dashboard by default:
+
+```python
+results = runner.run(tasks, model="gpt-4o-mini", stream=True, interactive=True)
+```
+
+In Jupyter, use the asynchronous API. The dashboard polls Jupyter UI events while the cell is
+busy, so paging, sorting, and expansion remain responsive during a batch:
+
+```python
+results = await runner.arun(tasks, model="gpt-4o-mini")
+```
+
+The dashboard displays 10 tasks per page with sortable columns for task index, generated
+character count, and completion. Expanding a task shows its complete message history plus the
+current assistant draft. The detail area preserves line breaks and scrolls when the content is
+long. Updates are batched to at most once every 100 ms, and the controls are updated in place so
+streaming refreshes do not replace a button while it is being clicked.
+
+In a terminal, the same data is shown in an inline Textual application. Select a row and press
+Enter to expand it, click a column header to sort, use Left/Right or the page buttons to change
+pages, and press `q` to hide the dashboard without cancelling the batch.
+
+The display behavior is controlled independently from backend streaming:
+
+| `interactive` | `show_progress` | Display |
+| --- | --- | --- |
+| `True` | `True` | Interactive table and progress bar |
+| `True` | `False` | Interactive table only |
+| `False` | `True` | tqdm progress bar only |
+| `False` | `False` | No display |
+
+Set `stream=False` to request a regular non-streaming response. The interactive table remains
+available, but its generated message and character count update only after each response is
+complete. `run()` and `arun()` always return the final ordered `list[Task]`; they do not return a
+stream iterator.
+
+The character column counts successfully completed assistant text across all pipeline turns plus
+the current draft. Partial output from a failed attempt is discarded before retrying. Progress
+treats `success`, `error`, and `cancelled` as completed terminal states and reports completed,
+remaining, and estimated time below the table.
 
 ## Client Support
 

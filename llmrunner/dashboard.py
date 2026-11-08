@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import inspect
 import json
 import math
 import sys
@@ -256,6 +257,15 @@ class JupyterDisplay(DisplayController):
 
     async def _refresh_loop(self) -> None:
         if not is_jupyter():
+            await self._run_refresh_loop()
+            return
+
+        from IPython import get_ipython
+
+        dispatch_shell = getattr(get_ipython().kernel, "dispatch_shell", None)
+        # ipykernel 7.4+ dispatches widget comms during async cells natively.
+        # Legacy UI polling replaces its lock with an incompatible nullcontext.
+        if dispatch_shell is not None and "concurrent" in inspect.signature(dispatch_shell).parameters:
             await self._run_refresh_loop()
             return
 

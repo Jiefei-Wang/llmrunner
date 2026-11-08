@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -604,6 +606,84 @@ def test_jupyter_dashboard_paginates_and_escapes_expanded_content():
         assert display._visible_indices[:2] == [10, 11]
         assert all(row.container.layout.display == "none" for row in display._rows[2:])
         await display.close()
+
+    asyncio.run(exercise())
+
+
+def test_jupyter_refresh_uses_native_comms_without_polling(monkeypatch):
+    display = JupyterDisplay(DashboardModel([Task(index=0, messages=[])]), show_progress=False)
+
+    async def dispatch_shell(msg, subshell_id=None, *, concurrent=False):
+        pass
+
+    kernel = SimpleNamespace(dispatch_shell=dispatch_shell, _main_asyncio_lock=asyncio.Lock())
+    original_lock = kernel._main_asyncio_lock
+    monkeypatch.setattr("IPython.get_ipython", lambda: SimpleNamespace(kernel=kernel))
+    monkeypatch.setattr("llmrunner.dashboard.is_jupyter", lambda: True)
+
+    def unexpected_polling():
+        pytest.fail("Native async comm handling must not start legacy polling")
+
+    monkeypatch.setitem(sys.modules, "jupyter_ui_poll", SimpleNamespace(ui_events=unexpected_polling))
+    entered = []
+
+    async def refresh(poll=None):
+        entered.append(poll)
+        assert kernel._main_asyncio_lock is original_lock
+
+    monkeypatch.setattr(display, "_run_refresh_loop", refresh)
+    asyncio.run(display._refresh_loop())
+    assert entered == [None]
+
+
+@pytest.mark.parametrize("has_dispatch_shell", [True, False])
+def test_jupyter_refresh_retains_polling_for_older_kernels(monkeypatch, has_dispatch_shell):
+    display = JupyterDisplay(DashboardModel([Task(index=0, messages=[])]), show_progress=False)
+
+    async def dispatch_shell(msg, subshell_id=None):
+        pass
+
+    kernel = SimpleNamespace(dispatch_shell=dispatch_shell) if has_dispatch_shell else SimpleNamespace()
+    monkeypatch.setattr("IPython.get_ipython", lambda: SimpleNamespace(kernel=kernel))
+    monkeypatch.setattr("llmrunner.dashboard.is_jupyter", lambda: True)
+    monkeypatch.setattr("llmrunner.dashboard.REFRESH_INTERVAL", 0)
+    events = []
+
+    async def poll(count):
+        events.append(count)
+        display._closed = True
+
+    @asynccontextmanager
+    async def ui_events():
+        events.append("enter")
+        try:
+            yield poll
+        finally:
+            events.append("exit")
+
+    monkeypatch.setitem(sys.modules, "jupyter_ui_poll", SimpleNamespace(ui_events=ui_events))
+    asyncio.run(display._refresh_loop())
+    assert events == ["enter", 10, "exit"]
+    assert display._rows[0].index.value == "0"
+
+
+def test_jupyter_native_refresh_cancels_cleanly(monkeypatch):
+    display = JupyterDisplay(DashboardModel([Task(index=0, messages=[])]), show_progress=False)
+    display._display = lambda _: None
+
+    async def dispatch_shell(msg, subshell_id=None, *, concurrent=False):
+        pass
+
+    kernel = SimpleNamespace(dispatch_shell=dispatch_shell)
+    monkeypatch.setattr("IPython.get_ipython", lambda: SimpleNamespace(kernel=kernel))
+    monkeypatch.setattr("llmrunner.dashboard.is_jupyter", lambda: True)
+
+    async def exercise():
+        await display.start()
+        await asyncio.sleep(0)
+        assert not display._refresh_task.done()
+        await display.close()
+        assert display._refresh_task.cancelled()
 
     asyncio.run(exercise())
 

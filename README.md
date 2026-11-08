@@ -103,8 +103,9 @@ Less common OpenAI request options can still be passed through as extra keyword 
 results = runner.run(tasks, model="gpt-4o-mini", stream=True, interactive=True)
 ```
 
-In Jupyter, use the asynchronous API. The dashboard polls Jupyter UI events while the cell is
-busy, so paging, sorting, and expansion remain responsive during a batch:
+In Jupyter, use the asynchronous API. The dashboard uses native async widget-event handling
+on ipykernel 7.4+ and polls UI events on older kernels, so paging, sorting, and expansion
+remain responsive during a batch:
 
 ```python
 results = await runner.arun(tasks, model="gpt-4o-mini")

@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0.0"]
+test = ["pytest>=8.0.0", "ipykernel>=6.0.0", "jupyter-client>=8.0.0"]
 
 [tool.setuptools.packages.find]
 include = ["llmrunner*"]

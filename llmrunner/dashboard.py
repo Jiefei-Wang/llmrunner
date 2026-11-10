@@ -140,16 +140,17 @@ class DashboardModel:
 
 def format_task_detail(task: Task, draft: str = "") -> str:
     blocks: list[str] = []
-    for message in task.messages:
-        blocks.append(json.dumps(message, ensure_ascii=False, indent=2, default=str))
+    messages = list(task.messages)
     if draft:
-        blocks.append(
-            json.dumps(
-                {"role": "assistant", "content": draft, "streaming": True},
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        messages.append({"role": "assistant", "content": draft, "streaming": True})
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            metadata = {key: value for key, value in message.items() if key != "content"}
+            header = json.dumps(metadata, ensure_ascii=False, indent=2, default=str)
+            blocks.append(f"{header}\n{content}")
+        else:
+            blocks.append(json.dumps(message, ensure_ascii=False, indent=2, default=str))
     if task.error:
         blocks.append(f"ERROR\n{task.error}")
     return "\n\n".join(blocks)
@@ -323,8 +324,7 @@ class JupyterDisplay(DisplayController):
             if self._expanded == row.index:
                 escaped = html.escape(row.detail)
                 widgets.detail.value = (
-                    '<pre style="white-space:pre-wrap;overflow-y:auto;max-height:320px;'
-                    f'border:1px solid #ccc;padding:8px;margin:2px 0 8px 0">{escaped}</pre>'
+                    f'<pre style="white-space:pre-wrap;margin:0">{escaped}</pre>'
                 )
                 widgets.detail.layout.display = ""
             else:
@@ -348,7 +348,11 @@ class JupyterDisplay(DisplayController):
         expand = self._widgets.Button(description="Expand", layout=self._widgets.Layout(width="90px"))
         expand.on_click(lambda _, selected_slot=slot: self._toggle_slot(selected_slot))
         summary = self._widgets.HBox([index, chars, complete, expand])
-        detail = self._widgets.HTML(layout=self._widgets.Layout(width="100%", display="none"))
+        # Keep scrolling on the widget root, not the HTML replaced during streaming.
+        detail = self._widgets.HTML(layout=self._widgets.Layout(
+            width="100%", display="none", max_height="320px", overflow="auto",
+            border="1px solid #ccc", padding="8px", margin="2px 0 8px 0",
+        ))
         container = self._widgets.VBox([summary, detail], layout=self._widgets.Layout(width="100%"))
         return _JupyterRow(container, index, chars, complete, expand, detail)
 

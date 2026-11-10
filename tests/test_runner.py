@@ -598,7 +598,10 @@ def test_jupyter_dashboard_paginates_and_escapes_expanded_content():
         display._rows[0].expand.click()
         expanded = display._rows[0].detail
         assert "&lt;0&gt;" in expanded.value
-        assert "max-height:320px" in expanded.value
+        assert "&lt;0&gt;\nnext" in expanded.value
+        assert "&lt;0&gt;\\nnext" not in expanded.value
+        assert expanded.layout.max_height == "320px"
+        assert expanded.layout.overflow == "auto"
         model.append_delta(0, "new text")
         display._refresh()
         assert [id(row.expand) for row in display._rows] == button_ids
@@ -608,6 +611,74 @@ def test_jupyter_dashboard_paginates_and_escapes_expanded_content():
         await display.close()
 
     asyncio.run(exercise())
+
+
+def test_expanded_messages_render_newlines_tabs_and_streamed_text_directly():
+    content = "first\nsecond\tcolumn\r\nthird"
+    task = Task(index=0, messages=[{"role": "user", "name": "example", "content": content}])
+    model = DashboardModel([task])
+    model.begin_attempt(0)
+    model.append_delta(0, "streamed\nanswer")
+    detail = model.snapshot(0).detail
+    assert content in detail
+    assert "streamed\nanswer" in detail
+    assert "first\\nsecond" not in detail
+    assert '"role": "user"' in detail
+    assert '"name": "example"' in detail
+    assert '"streaming": true' in detail
+    assert task.messages == [{"role": "user", "name": "example", "content": content}]
+
+
+def test_expanded_messages_preserve_literal_escapes_and_backslashes():
+    content = r"C:\new\notes and regex \n"
+    model = DashboardModel([Task(index=0, messages=[{"role": "user", "content": content}])])
+    detail = model.snapshot(0).detail
+    assert content in detail
+    assert "C:\n" not in detail
+    assert "regex \n" not in detail
+
+
+def test_expanded_messages_keep_structured_content_and_errors_readable():
+    message = {"role": "user", "content": [{"type": "text", "text": "example"}]}
+    task = Task(index=0, messages=[message], error="first\nsecond")
+    detail = DashboardModel([task]).snapshot(0).detail
+    assert json.dumps(message, ensure_ascii=False, indent=2) in detail
+    assert "ERROR\nfirst\nsecond" in detail
+
+
+def test_expanded_detail_keeps_scroll_container_during_streaming():
+    tasks = [Task(index=0, messages=[{"role": "user", "content": "long line\n" * 100}])]
+    model = DashboardModel(tasks)
+    display = JupyterDisplay(model, show_progress=False)
+    model.begin_attempt(0)
+    display._refresh(force=True)
+    display._rows[0].expand.click()
+    detail = display._rows[0].detail
+    original_widget_id = detail.model_id
+    original_layout_id = detail.layout.model_id
+    original_layout = detail.layout.get_state()
+
+    assert detail.layout.max_height == "320px"
+    assert detail.layout.overflow == "auto"
+    assert "overflow" not in detail.value
+    assert "max-height" not in detail.value
+    for index in range(10):
+        model.append_delta(0, f"chunk {index}\n")
+        display._refresh()
+        assert display._rows[0].container.children[1] is detail
+        assert detail.model_id == original_widget_id
+        assert detail.layout.model_id == original_layout_id
+        assert detail.layout.get_state() == original_layout
+        assert f"chunk {index}" in detail.value
+        assert "overflow" not in detail.value
+        assert "max-height" not in detail.value
+
+    display._rows[0].expand.click()
+    assert detail.layout.display == "none"
+    display._rows[0].expand.click()
+    assert detail.layout.display == ""
+    assert detail.model_id == original_widget_id
+    assert "chunk 9" in detail.value
 
 
 def test_jupyter_refresh_uses_native_comms_without_polling(monkeypatch):

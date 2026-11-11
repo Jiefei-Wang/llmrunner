@@ -113,9 +113,12 @@ class Runner:
             timeout=timeout,
             extra_kwargs=request_kwargs,
         )
-        self._validate_request_kwargs(request_kwargs)
         self._interrupted = False
         self._init_results(inputs)
+        if not self.last_results:
+            self._validate_request_kwargs(request_kwargs)
+        for task in self.last_results:
+            self._task_request_kwargs(task, request_kwargs)
         dashboard = DashboardModel(self.last_results)
         display = make_display(
             dashboard,
@@ -270,7 +273,8 @@ class Runner:
             try:
                 async with semaphore:
                     task.metadata["total_backend_calls"] = task.metadata.get("total_backend_calls", 0) + 1
-                    response = await self._create(messages=task.messages, stream=stream, **request_kwargs)
+                    kwargs = self._task_request_kwargs(task, request_kwargs)
+                    response = await self._create(messages=task.messages, stream=stream, **kwargs)
                     if stream:
                         text = await self._consume_stream(
                             response,
@@ -367,8 +371,17 @@ class Runner:
         return call
 
     def _validate_request_kwargs(self, request_kwargs: dict[str, Any]) -> None:
+        if {"messages", "stream"}.intersection(request_kwargs):
+            raise ValueError("Backend options cannot override runner-controlled `messages` or `stream`.")
         if not request_kwargs.get("model"):
-            raise ValueError("Runner requires `model` to be passed to `run()` or `arun()`.")
+            raise ValueError("Runner requires `model` in batch options or task.backend_kwargs.")
+
+    def _task_request_kwargs(self, task: Task, request_kwargs: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(task.backend_kwargs, dict):
+            raise TypeError("task.backend_kwargs must be a dictionary")
+        kwargs = {**request_kwargs, **task.backend_kwargs}
+        self._validate_request_kwargs(kwargs)
+        return kwargs
 
     def _build_request_kwargs(
         self,

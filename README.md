@@ -95,6 +95,32 @@ Common request settings such as `model`, `temperature`, `max_tokens`, `top_p`, `
 `presence_penalty`, `frequency_penalty`, and `timeout` are exposed directly on `run()` and `arun()`.
 Less common OpenAI request options can still be passed through as extra keyword arguments.
 
+### Per-Task Backend Options
+
+Use `backend_kwargs` to override batch request settings for an individual task. It defaults
+to an independent empty dictionary. `client_kwarg()` builds this dictionary from keyword arguments:
+
+```python
+from llmrunner import Task, client_kwarg
+
+task = Task(
+    messages=[{"role": "user", "content": "Return a JSON object."}],
+    customer_id="customer-1",
+    backend_kwargs=client_kwarg(
+        response_format={"type": "json_object"},
+        max_tokens=512,
+    ),
+)
+results = await runner.arun([task], model="gpt-4o-mini", max_tokens=1024)
+```
+
+This task uses `max_tokens=512`; `customer_id` remains local metadata and is not sent to
+the client. A plain dictionary also works. Options are applied on every request, including
+retries and pipeline follow-up turns. Pipelines returning a new `Task` should pass
+`backend_kwargs=task.backend_kwargs` to retain the previous task's options.
+`messages` and `stream` cannot be set inside `backend_kwargs` because the runner controls them.
+The effective request must specify `model`, either in the batch settings or in `backend_kwargs`.
+
 ## Streaming and interactive dashboards
 
 `run()` and `arun()` stream Chat Completions and show an interactive dashboard by default:
